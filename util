@@ -1,0 +1,179 @@
+package ccx.medcompass.controller
+
+import org.apache.log4j.LogManager
+import org.apache.log4j.Logger
+import org.apache.spark.sql.{DataFrame, SparkSession}
+
+import scala.util.Try
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.io.IOUtils
+import java.io.IOException
+
+import com.carecentrix.common.dho.jsontemplate.generator.DeterministicGuid
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions._
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.FSDataOutputStream
+
+trait Util {
+  @transient lazy val logger: Logger = LogManager.getLogger("Data Migration")
+
+  def getSession(mode: String, app: String): SparkSession={
+    logger.info(" ### getSession ###")
+    return SparkSession
+      .builder
+      .appName(app)
+      .master(mode)
+      .config("hive.exec.dynamic.partition", "true")
+      .config("hive.exec.dynamic.partition.mode", "nonstrict")
+      .config("spark.speculation","false")
+      .enableHiveSupport()
+      .getOrCreate()
+  }
+
+  def copyMerge(
+                 srcFS: FileSystem, srcDir: Path,
+                 dstFS: FileSystem, dstFile: Path,
+                 deleteSource: Boolean, conf: Configuration
+               ): Boolean = {
+
+    if (dstFS.exists(dstFile))
+      throw new IOException(s"Target $dstFile already exists")
+
+    if (srcFS.getFileStatus(srcDir).isDirectory()) {
+
+      val outputFile = dstFS.create(dstFile)
+      Try {
+        srcFS
+          .listStatus(srcDir)
+          .sortBy(_.getPath.getName)
+          .collect {
+            case status if status.isFile() =>
+              val inputFile = srcFS.open(status.getPath())
+              Try(IOUtils.copyBytes(inputFile, outputFile, conf, false))
+              inputFile.close()
+          }
+      }
+      outputFile.close()
+
+      if (deleteSource) srcFS.delete(srcDir, true) else true
+    }
+    else false
+  }
+
+  /**
+   * This function checks with the DataFrame is empty or not
+   * @param df
+   * @return boolean
+   */
+  def isDataFrameEmpty(df:DataFrame):Boolean ={
+    if(df.head(1).isEmpty) true else false
+  }
+  /**
+   * This function adds the quotes to the string
+   * @param inputStr
+   * @return
+   */
+  def quoteStr(inputStr:String) ={
+    val spaces = """[\s]*"""
+    if (inputStr== null) {
+      ""
+    }
+    else if(inputStr.matches(spaces)){
+      inputStr
+    }
+    else{
+      val quotePattern = """[\u0022\u201C\u201D\u201F\u301D\u301E]"""
+      val outStr = inputStr.replaceAll(quotePattern,"\"\"")
+      "\""+outStr+"\""
+    }
+  }
+
+  //user defined function created for handling type key values
+  def lookupMCValue(typeKeyMap:Map[String,Map[String,String]]) =udf((inputDHVal:String,inputTypeKey:String) => {    
+    var tempInputVal = ""
+    if (inputDHVal == null) {
+      tempInputVal = ""
+    }else {
+      tempInputVal = inputDHVal.trim()
+    }
+    var mcValue=""
+    if (typeKeyMap.keys.toList.contains(inputTypeKey)) {
+      mcValue = typeKeyMap.get(inputTypeKey).get.getOrElse(tempInputVal,"Default")
+      if (mcValue == "Default") {
+        mcValue = typeKeyMap.get(inputTypeKey).get.getOrElse("Default","NotFound")
+        mcValue
+      }
+      else { mcValue }
+    }
+    else { mcValue }
+  } )
+
+  //user defined function created for handling derived and type key values
+  def typeKeyDerived(typeKeyMap:Map[String,Map[String,String]],derivationKeyMap:Map[String,Map[String,String]]) =udf((inputDHvalues:String,inputTypeKey:String) => {
+    var derivedVal = ""
+    var derivationCol = inputDHvalues.split('~')
+    if (!derivationCol(0).equals("empty")) {
+      if (derivationKeyMap.keys.toList.contains(derivationCol(0).trim.toUpperCase)) {
+        val derivationMap = derivationKeyMap.get(derivationCol(0).trim.toUpperCase).get
+        val derivationKeys = derivationMap.keys.toList
+        derivationKeys.foreach(key =>
+        {
+          if (key.split('|').contains(derivationCol(1).trim.toUpperCase)) {
+            derivedVal = derivationMap.get(key).get
+          }
+        })
+      }}
+    var mcValue=""
+    if (typeKeyMap.keys.toList.contains(inputTypeKey)) {
+      mcValue = typeKeyMap.get(inputTypeKey).get.getOrElse(derivedVal,"Default")
+      if (mcValue == "Default") {
+        mcValue = typeKeyMap.get(inputTypeKey).get.getOrElse("Default","NotFound")
+        mcValue
+      }
+      else { mcValue }
+    }
+    else { mcValue }
+  } )
+
+  /**
+   * Generate composite key using DeterministicGuid
+   */
+  def generateCompositeKey(idVal :String,strVal : String) ={
+    if (idVal == null ) {
+      ""
+    }
+    else
+    {
+      val compKey = if(strVal == null) {DeterministicGuid.getUUID(idVal)} else {DeterministicGuid.getUUID(idVal,strVal)}
+      compKey.toString
+    }
+  }
+
+  def createTrackingFile(fileName:String,content:String)={
+    val logFile = new Path(fileName)
+    val conf = new Configuration()
+    conf.setBoolean("fs.hdfs.impl.disable.cache", true)
+    val fs = FileSystem.get(conf)
+    var fileOutputStream:FSDataOutputStream= null;
+    try {
+      if (fs.exists(logFile)) {
+        fileOutputStream = fs.append(logFile);
+        fileOutputStream.writeBytes(content + '\n');
+      } else {
+        fileOutputStream = fs.create(logFile);
+        fileOutputStream.writeBytes(content + '\n');
+      }
+    } finally {
+      if (fs != null) {
+        fs.close();
+      }
+      if (fs != null) {
+        fs.close();
+      }
+    }
+  }
+}

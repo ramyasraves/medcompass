@@ -1,0 +1,117 @@
+package ccx.medcompass.controller
+import java.io._
+import java.util.Properties
+
+import ccx.medcompass.Utils.{AppUtil, Global}
+import org.apache.hadoop.conf.Configuration
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.sql.types.{DataType, StructType}
+
+import scala.io.Source
+import scala.collection.mutable.ListBuffer
+
+object driver extends Util {
+  def main(args: Array[String]): Unit = {
+          var mode             = ""
+          var sessionName      = ""
+          var configFile       = ""
+          var propertyFile  =""
+          var hiveDF: DataFrame = null
+          // Pass below arguments for the spark submit in order:
+          //	1. Mode of Spark execution - Local/cluster
+          //  2. Spark Session name
+          //  3. Configuration File - CSV for source to target mapping including transformation details
+          //  4. Property file - contains the common params
+          if(args.size == 4){
+            mode        = args(0)
+            sessionName = args(1)
+            configFile  = args(2)
+            propertyFile = args(3)
+            logger.info("### Starting the job ###")
+            logger.info("==================================================")
+            logger.info(s"### Running mode : $mode ###")
+            logger.info(s"### Spark session name : $sessionName ###")
+            logger.info(s"### Config File Path  : $configFile ###")
+            logger.info(s"### Property File   : $propertyFile ###")
+            logger.info("==================================================")
+          } else
+          {
+            logger.info("### Please provide the required arguments ###")
+            System.exit(1)
+          }
+    try {
+      val spark = getSession(mode, sessionName)
+      logger.info("### session created successfully ###")
+      AppUtil.LoadConfigFile(spark, configFile)
+      logger.info("### Config map generated successfully ###")
+
+      //Read Properties file
+      //val properties : Properties = new Properties()
+      val source = scala.io.Source.fromFile(propertyFile)
+      if (source != null) {
+        Global.properties.load(source.bufferedReader())
+      }
+      else {
+        logger.error("properties file not valid")
+        sys.exit()
+      }
+
+      //Getting timestamp for out file
+      val outFileTimeSt = Global.getCurrentTime()
+      Global.configMap.foreach(f => {
+        val objName = f._1
+        val objConfig = f._2
+        logger.info(s"### Process started for $objName ###")
+        val schema = AppUtil.BuildSchema(spark, objConfig("map-file-name"))
+        logger.info("### Mapping file processed and List[Map[Key,Value]] built successfully ###")
+        //Read Input Dataframe
+        val hivedb    = objConfig("input-db")
+        val hiveTable = objConfig("input-table-name")
+        val hFlag = objConfig("hqlFlag")
+        val hPath = objConfig("hql-path")
+        logger.info("### hPath Value ###" + hPath)     
+        logger.info("### hFlag Value ###" + hFlag)
+        
+        if (hFlag == "Y") {
+          val queryFile = Source.fromFile(hPath).mkString
+          hiveDF = spark.sql(queryFile)
+          logger.info("### HSQL Dataframe ###")
+          hiveDF.show(false)
+        } else {
+          val sql = s"select * from ( select *, row_number() OVER (PARTITION BY gdfid ORDER BY loaddt desc ) my_rank from $hivedb.$hiveTable ) $hiveTable where my_rank = 1";
+          hiveDF = spark.sql( sql )
+        }
+        
+        hiveDF.createOrReplaceTempView("rawTbl")
+        logger.info("### Input Dataframe is read from the source ###")
+        //Create transfomed dataframe
+        val transformedDf: DataFrame = AppUtil.frameQueryList(spark, Global.schemaMap,objName,objConfig)
+        logger.info(s"### Transformed Dataframe created successfully for $objName ###")
+        //Write Transformed dataframe
+        transformedDf.coalesce(1).write.mode("append").format("text").save(objConfig("out-file-path")+objConfig("out-file-name")+"_" + outFileTimeSt)
+        logger.info(s"### Dataframe is written into files for $objName ###")
+        //Creating tracking file to store the list of objects and timestamp
+        val trackingContent=objConfig("out-file-name") + "_" + outFileTimeSt + "." + objConfig("file-format") + "|" + outFileTimeSt + "|" + objName + "|" + transformedDf.count().toString
+
+        val logfileName = Global.properties.getProperty("dm_log_hdfs_path") + Global.properties.getProperty("dm_log_file_nm_format") + outFileTimeSt + "." + Global.properties.getProperty("dm_log_file_extn")
+        createTrackingFile(logfileName,trackingContent)
+        logger.info(s"### Output Tracking File created for $objName @ $logfileName###")
+      })
+      val hadoopConfig = new Configuration()
+      val fs = FileSystem.get(hadoopConfig)
+      Global.dirMap.foreach( i => {
+        val srcDir = new Path(i._2+i._1+"_"+outFileTimeSt)
+        val dstFile = new Path(i._2+i._1+"_"+outFileTimeSt+".txt")
+        copyMerge(fs, srcDir, fs, dstFile, true, hadoopConfig)
+      }
+      )
+    }
+    catch {
+      case e:Exception => {
+            logger.error(e)
+            throw(e)
+      }
+    }
+  }
+}
